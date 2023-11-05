@@ -17,15 +17,10 @@
 #define REAL_NODES_NUM(n) n-1
 #define STARTING_LEVEL_NUM 1
 #define STARTING_NODE 0
-#define USE_HOST 0
+#define USE_HOST 1
 #define USE_PREFIX_SUM 0
 
 #define DEVICE_SHARED_MEM_PER_BLOCK 65536/16
-
-const char *file_out_next_level_node_file_name = "file_out_next_level.txt";
-const char *file_out_visited_node_file_name = "file_out_visited.txt";
-//you have to create this directory and load the source test file
-const char* file_name = "./standard5.txt";
 
 typedef struct Vector {
   int32_t* buff;
@@ -460,7 +455,7 @@ void launch_device_global_queue_kernel(
 }
 #endif
 
-int main(int argc, char* argv[]) {
+int prepare_and_spawn(const char* input_file, const char* next_level_out_file, const char* visited_out_file) {
 #if (USE_HOST == 0)
   // retrieve some info abfile_out_next_level_node the CUDA device
   int32_t num_devices;
@@ -518,17 +513,17 @@ int main(int argc, char* argv[]) {
   int32_t last_node_val = 0;
   FILE *file_out_next_level_node;
   FILE *file_out_visited_node;
-  file = fopen(file_name, "r");
+  file = fopen(input_file, "r");
   if (file == NULL) {
     printf("Error opening the file.\n");
     return 1;
   }
-  file_out_next_level_node = fopen(file_out_next_level_node_file_name, "w");
+  file_out_next_level_node = fopen(next_level_out_file, "w");
   if (file_out_next_level_node == NULL) {
     printf("Error opening the file_out_next_level_node file.\n");
     return 1;
   }
-  file_out_visited_node = fopen(file_out_visited_node_file_name, "w");
+  file_out_visited_node = fopen(visited_out_file, "w");
   if (file_out_visited_node == NULL) {
     printf("Error opening the file_out_next_level_node file.\n");
     return 1;
@@ -591,7 +586,7 @@ int main(int argc, char* argv[]) {
     printf("failed malloc - next_level_nodes\n");
   }
 
-  file = fopen(file_name, "r");
+  file = fopen(input_file, "r");
   line_counter = 0;
   if (file == NULL) {
     printf("Can not open the file");
@@ -765,5 +760,75 @@ int main(int argc, char* argv[]) {
   cudaFree(num_next_level_nodes);
 #endif
 
+  return 0;
+}
+
+int main(int argc, char* argv[]) {
+  int in_count;
+#if (USE_HOST == 1)
+  char** in_values;
+  in_count = argc;
+  in_values = (char**)malloc(sizeof(char*) * in_count);
+  if (!in_values) {
+    printf("malloc failed - in_values\n");
+    return 1;
+  }
+  for (int32_t i=0; i<in_count; i++) {
+    in_values[i] = (char*)malloc(sizeof(char) * (strlen(argv[i]) + 1));
+    if (!in_values[i]) {
+      printf("malloc failed - in_values[%u]\n", i);
+      return 1;
+    }
+    memcpy(in_values[i], argv[i], strlen(argv[i]) + 1);
+  }
+  if (argc == 0) {
+    printf("no input file specified\n");
+    return 0;
+  }
+#else
+  in_count = 2; //to complete (set the value to input file num + 1)
+  char in_values[][100] =  {
+    "standard5.txt", "standard6.txt"
+  }; 
+  if (in_count == 0) {
+    printf("no input file specified. please set input files at line %d\n", __LINE__);
+    return 0;
+  }
+#endif
+#if (USE_HOST == 1)
+  for (int32_t i=1; i<in_count; i++) {
+#else
+  for (int32_t i=0; i<in_count; i++) {
+#endif
+    printf("computing: %s\n", in_values[i]);
+    const size_t file_name_len = strlen(in_values[i]);
+    char* level_out_file_name = (char*)malloc((file_name_len + 15) * sizeof(char));
+    char* visited_out_file_name = (char*)malloc((file_name_len + 15) * sizeof(char));
+    if (!level_out_file_name) {
+      printf("malloc failed - level_out_file_name\n");
+      return 1;
+    }
+    if (!visited_out_file_name) {
+      printf("malloc failed - visited_out_file_name\n");
+      return 1;
+    }
+    memcpy(level_out_file_name, in_values[i], sizeof(char) * (file_name_len-4));
+    memcpy(visited_out_file_name, in_values[i], sizeof(char) * (file_name_len-4));
+    strcat(level_out_file_name, "_next_level_out.txt");
+    strcat(visited_out_file_name, "_visited_out.txt");
+    if(prepare_and_spawn(in_values[i], level_out_file_name, visited_out_file_name)) {
+      printf("kernel failed for %s\n", in_values[i]);
+    } else {
+      printf("kernel ended for %s\n\n", in_values[i]);
+    }
+    free(level_out_file_name);
+    free(visited_out_file_name);
+  }
+#if (USE_HOST == 1)
+  for (int32_t i=0; i<in_count; i++) {
+    free(in_values[i]);
+  }
+  free(in_values);
+#endif
   return 0;
 }

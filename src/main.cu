@@ -10,9 +10,9 @@
 #define DEBUG_HOST_KER 0
 #define DEBUG_KER 0
 #define DEBUG_KER_GRID 0
+#define PRODUCE_OUT_FILE 1
 #define ERROR 1
 #define MAX_FILE_COLUMN_LEN 100
-#define PRODUCE_OUT_FILE 1
 #define REAL_NEIGHBOURS_NUM(n) REAL_NODES_NUM(n)
 #define REAL_NODES_NUM(n) n-1
 #define STARTING_LEVEL_NUM 1
@@ -21,10 +21,6 @@
 #define USE_PREFIX_SUM 0
 
 #define DEVICE_SHARED_MEM_PER_BLOCK 65536/16
-
-const char *file_out_next_level_node_file_name = "file_out_next_level.txt";
-const char *file_out_visited_node_file_name = "file_out_visited.txt";
-const char* file_name = "./3.txt";
 
 typedef struct Vector {
   int32_t* buff;
@@ -172,10 +168,8 @@ __global__ void gpu_global_queuing_kernel(int32_t *node_ptr, int32_t *node_neigh
   }
   for (int32_t j=node_ptr[node]; j<node_ptr[node+1]; ++j) {
     const int32_t n = node_neighbours[j];
-    const int32_t visited = atomicAnd(&node_visited[n], 1);
+    const int32_t visited = atomicCAS(&node_visited[n], 0, 1);
     if (visited == 0) {
-      atomicOr(&node_visited[n], 1);
-      //node_visited[n] = 1;
       int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
       next_level_nodes[next_pos] = n;
     }
@@ -210,10 +204,13 @@ __global__ void gpu_block_queuing_kernel(int32_t *node_ptr, int32_t *node_neighb
 #if (DEBUG_KER == 1)
         printf("computing node %u neighbours %u thread %u block %u\n", node, n, threadIdx.x, blockIdx.x * blockDim.x);
 #endif
-        const int32_t visited = atomicAnd(&node_visited[n], 1);
+        const int32_t visited = atomicCAS(&node_visited[n], 0, 1);
         if (visited == 0) {
-          atomicOr(&node_visited[n], 1);
           int32_t next_pos_shared = atomicAdd(&shared_block_num_next_level_nodes, 1);
+          if (next_pos_shared >= DEVICE_SHARED_MEM_PER_BLOCK) {
+            printf("FATAL: next_pos_shared >= DEVICE_SHARED_MEM_PER_BLOCK\n");
+            break;
+          }
           shared_block_queue[next_pos_shared] = n;
         }
       }
@@ -310,20 +307,15 @@ void launch_device_shared_queue_kernel(
   cudaMemcpy(num_out_level, &num_curr_level_nodes, sizeof(int32_t), cudaMemcpyHostToDevice);
   while (!done) {
     cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    if (levels == 0 || levels%2 == 0) {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
+    grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
 #if (DEBUG_KER_GRID == 1)
       printf("num grid %u\n", grid_size);
       printf("total threads: %u\n", grid_size * threads_per_block);
 #endif
+    if (levels == 0 || levels%2 == 0) {
       in_level = d_curr_level_nodes;
       out_level = d_next_level_nodes;
     } else {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
-#if (DEBUG_KER_GRID == 1)
-      printf("num grid %u\n", grid_size);
-      printf("total threads: %u\n", grid_size * threads_per_block);
-#endif
       in_level = d_next_level_nodes;
       out_level = d_curr_level_nodes;
     }
@@ -336,6 +328,7 @@ void launch_device_shared_queue_kernel(
     gpu_block_queuing_kernel<<<grid_size, threads_per_block>>>(
         d_node_ptr, d_node_neighbours, d_node_visited, in_level, out_level,
         kernel_num_curr_level_nodes, total_neighbours, num_out_level);
+    cudaDeviceSynchronize();
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&level_global_queue_gpu_elapsed_time_ms, start, stop);
@@ -397,20 +390,15 @@ void launch_device_global_queue_kernel(
   cudaMemcpy(num_out_level, &num_curr_level_nodes, sizeof(int32_t), cudaMemcpyHostToDevice);
   while (!done) {
     cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    if (levels == 0 || levels%2 == 0) {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
+    grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
 #if (DEBUG_KER_GRID == 1)
-      printf("num grid %u\n", grid_size);
-      printf("total threads: %u\n", grid_size * threads_per_block);
+    printf("num grid %u\n", grid_size);
+    printf("total threads: %u\n", grid_size * threads_per_block);
 #endif
+    if (levels == 0 || levels%2 == 0) {
       in_level = d_curr_level_nodes;
       out_level = d_next_level_nodes;
     } else {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
-#if (DEBUG_KER_GRID == 1)
-      printf("num grid %u\n", grid_size);
-      printf("total threads: %u\n", grid_size * threads_per_block);
-#endif
       in_level = d_next_level_nodes;
       out_level = d_curr_level_nodes;
     }
@@ -423,6 +411,7 @@ void launch_device_global_queue_kernel(
     gpu_global_queuing_kernel<<<grid_size, threads_per_block>>>(
         d_node_ptr, d_node_neighbours, d_node_visited, in_level, out_level,
         kernel_num_curr_level_nodes, total_neighbours, num_out_level);
+    cudaDeviceSynchronize();
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&level_global_queue_gpu_elapsed_time_ms, start, stop);
@@ -466,7 +455,7 @@ void launch_device_global_queue_kernel(
 }
 #endif
 
-int main(int argc, char* argv[]) {
+int prepare_and_spawn(const char* input_file, const char* next_level_out_file, const char* visited_out_file) {
 #if (USE_HOST == 0)
   // retrieve some info abfile_out_next_level_node the CUDA device
   int32_t num_devices;
@@ -524,17 +513,17 @@ int main(int argc, char* argv[]) {
   int32_t last_node_val = 0;
   FILE *file_out_next_level_node;
   FILE *file_out_visited_node;
-  file = fopen(file_name, "r");
+  file = fopen(input_file, "r");
   if (file == NULL) {
     printf("Error opening the file.\n");
     return 1;
   }
-  file_out_next_level_node = fopen(file_out_next_level_node_file_name, "w");
+  file_out_next_level_node = fopen(next_level_out_file, "w");
   if (file_out_next_level_node == NULL) {
     printf("Error opening the file_out_next_level_node file.\n");
     return 1;
   }
-  file_out_visited_node = fopen(file_out_visited_node_file_name, "w");
+  file_out_visited_node = fopen(visited_out_file, "w");
   if (file_out_visited_node == NULL) {
     printf("Error opening the file_out_next_level_node file.\n");
     return 1;
@@ -597,7 +586,7 @@ int main(int argc, char* argv[]) {
     printf("failed malloc - next_level_nodes\n");
   }
 
-  file = fopen(file_name, "r");
+  file = fopen(input_file, "r");
   line_counter = 0;
   if (file == NULL) {
     printf("Can not open the file");
@@ -771,5 +760,75 @@ int main(int argc, char* argv[]) {
   cudaFree(num_next_level_nodes);
 #endif
 
+  return 0;
+}
+
+int main(int argc, char* argv[]) {
+  int in_count;
+#if (USE_HOST == 1)
+  char** in_values;
+  in_count = argc;
+  in_values = (char**)malloc(sizeof(char*) * in_count);
+  if (!in_values) {
+    printf("malloc failed - in_values\n");
+    return 1;
+  }
+  for (int32_t i=0; i<in_count; i++) {
+    in_values[i] = (char*)malloc(sizeof(char) * (strlen(argv[i]) + 1));
+    if (!in_values[i]) {
+      printf("malloc failed - in_values[%u]\n", i);
+      return 1;
+    }
+    memcpy(in_values[i], argv[i], strlen(argv[i]) + 1);
+  }
+  if (argc == 0) {
+    printf("no input file specified\n");
+    return 0;
+  }
+#else
+  in_count = 2; //to complete (set the value to input file num + 1)
+  char in_values[][100] =  {
+    "standard5.txt", "standard6.txt"
+  }; 
+  if (in_count == 0) {
+    printf("no input file specified. please set input files at line %d\n", __LINE__);
+    return 0;
+  }
+#endif
+#if (USE_HOST == 1)
+  for (int32_t i=1; i<in_count; i++) {
+#else
+  for (int32_t i=0; i<in_count; i++) {
+#endif
+    printf("computing: %s\n", in_values[i]);
+    const size_t file_name_len = strlen(in_values[i]);
+    char* level_out_file_name = (char*)malloc((file_name_len + 15) * sizeof(char));
+    char* visited_out_file_name = (char*)malloc((file_name_len + 15) * sizeof(char));
+    if (!level_out_file_name) {
+      printf("malloc failed - level_out_file_name\n");
+      return 1;
+    }
+    if (!visited_out_file_name) {
+      printf("malloc failed - visited_out_file_name\n");
+      return 1;
+    }
+    memcpy(level_out_file_name, in_values[i], sizeof(char) * (file_name_len-4));
+    memcpy(visited_out_file_name, in_values[i], sizeof(char) * (file_name_len-4));
+    strcat(level_out_file_name, "_next_level_out.txt");
+    strcat(visited_out_file_name, "_visited_out.txt");
+    if(prepare_and_spawn(in_values[i], level_out_file_name, visited_out_file_name)) {
+      printf("kernel failed for %s\n", in_values[i]);
+    } else {
+      printf("kernel ended for %s\n\n", in_values[i]);
+    }
+    free(level_out_file_name);
+    free(visited_out_file_name);
+  }
+#if (USE_HOST == 1)
+  for (int32_t i=0; i<in_count; i++) {
+    free(in_values[i]);
+  }
+  free(in_values);
+#endif
   return 0;
 }
