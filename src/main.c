@@ -10,21 +10,22 @@
 #define DEBUG_HOST_KER 0
 #define DEBUG_KER 0
 #define DEBUG_KER_GRID 0
+#define PRODUCE_OUT_FILE 1
 #define ERROR 1
 #define MAX_FILE_COLUMN_LEN 100
-#define PRODUCE_OUT_FILE 1
 #define REAL_NEIGHBOURS_NUM(n) REAL_NODES_NUM(n)
 #define REAL_NODES_NUM(n) n-1
 #define STARTING_LEVEL_NUM 1
 #define STARTING_NODE 0
-#define USE_HOST 1
+#define USE_HOST 0
 #define USE_PREFIX_SUM 0
 
 #define DEVICE_SHARED_MEM_PER_BLOCK 65536/16
 
 const char *file_out_next_level_node_file_name = "file_out_next_level.txt";
 const char *file_out_visited_node_file_name = "file_out_visited.txt";
-const char* file_name = "./3.txt";
+//you have to create this directory and load the source test file
+const char* file_name = "./standard5.txt";
 
 typedef struct Vector {
   int32_t* buff;
@@ -172,10 +173,8 @@ __global__ void gpu_global_queuing_kernel(int32_t *node_ptr, int32_t *node_neigh
   }
   for (int32_t j=node_ptr[node]; j<node_ptr[node+1]; ++j) {
     const int32_t n = node_neighbours[j];
-    const int32_t visited = atomicAnd(&node_visited[n], 1);
+    const int32_t visited = atomicCAS(&node_visited[n], 0, 1);
     if (visited == 0) {
-      atomicOr(&node_visited[n], 1);
-      //node_visited[n] = 1;
       int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
       next_level_nodes[next_pos] = n;
     }
@@ -210,10 +209,13 @@ __global__ void gpu_block_queuing_kernel(int32_t *node_ptr, int32_t *node_neighb
 #if (DEBUG_KER == 1)
         printf("computing node %u neighbours %u thread %u block %u\n", node, n, threadIdx.x, blockIdx.x * blockDim.x);
 #endif
-        const int32_t visited = atomicAnd(&node_visited[n], 1);
+        const int32_t visited = atomicCAS(&node_visited[n], 0, 1);
         if (visited == 0) {
-          atomicOr(&node_visited[n], 1);
           int32_t next_pos_shared = atomicAdd(&shared_block_num_next_level_nodes, 1);
+          if (next_pos_shared >= DEVICE_SHARED_MEM_PER_BLOCK) {
+            printf("FATAL: next_pos_shared >= DEVICE_SHARED_MEM_PER_BLOCK\n");
+            break;
+          }
           shared_block_queue[next_pos_shared] = n;
         }
       }
@@ -310,20 +312,15 @@ void launch_device_shared_queue_kernel(
   cudaMemcpy(num_out_level, &num_curr_level_nodes, sizeof(int32_t), cudaMemcpyHostToDevice);
   while (!done) {
     cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    if (levels == 0 || levels%2 == 0) {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
+    grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
 #if (DEBUG_KER_GRID == 1)
       printf("num grid %u\n", grid_size);
       printf("total threads: %u\n", grid_size * threads_per_block);
 #endif
+    if (levels == 0 || levels%2 == 0) {
       in_level = d_curr_level_nodes;
       out_level = d_next_level_nodes;
     } else {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
-#if (DEBUG_KER_GRID == 1)
-      printf("num grid %u\n", grid_size);
-      printf("total threads: %u\n", grid_size * threads_per_block);
-#endif
       in_level = d_next_level_nodes;
       out_level = d_curr_level_nodes;
     }
@@ -336,6 +333,7 @@ void launch_device_shared_queue_kernel(
     gpu_block_queuing_kernel<<<grid_size, threads_per_block>>>(
         d_node_ptr, d_node_neighbours, d_node_visited, in_level, out_level,
         kernel_num_curr_level_nodes, total_neighbours, num_out_level);
+    cudaDeviceSynchronize();
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&level_global_queue_gpu_elapsed_time_ms, start, stop);
@@ -397,20 +395,15 @@ void launch_device_global_queue_kernel(
   cudaMemcpy(num_out_level, &num_curr_level_nodes, sizeof(int32_t), cudaMemcpyHostToDevice);
   while (!done) {
     cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    if (levels == 0 || levels%2 == 0) {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
+    grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
 #if (DEBUG_KER_GRID == 1)
-      printf("num grid %u\n", grid_size);
-      printf("total threads: %u\n", grid_size * threads_per_block);
+    printf("num grid %u\n", grid_size);
+    printf("total threads: %u\n", grid_size * threads_per_block);
 #endif
+    if (levels == 0 || levels%2 == 0) {
       in_level = d_curr_level_nodes;
       out_level = d_next_level_nodes;
     } else {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
-#if (DEBUG_KER_GRID == 1)
-      printf("num grid %u\n", grid_size);
-      printf("total threads: %u\n", grid_size * threads_per_block);
-#endif
       in_level = d_next_level_nodes;
       out_level = d_curr_level_nodes;
     }
@@ -423,6 +416,7 @@ void launch_device_global_queue_kernel(
     gpu_global_queuing_kernel<<<grid_size, threads_per_block>>>(
         d_node_ptr, d_node_neighbours, d_node_visited, in_level, out_level,
         kernel_num_curr_level_nodes, total_neighbours, num_out_level);
+    cudaDeviceSynchronize();
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&level_global_queue_gpu_elapsed_time_ms, start, stop);
