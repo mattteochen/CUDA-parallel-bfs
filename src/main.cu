@@ -22,6 +22,10 @@
 
 #define DEVICE_SHARED_MEM_PER_BLOCK 65536/16
 
+#if (USE_HOST == 1)
+#warning "Using USE_HOST == 1 my NOT work on collab if binary is not called manually"
+#endif
+
 typedef struct Vector {
   int32_t* buff;
   int32_t size;
@@ -272,7 +276,7 @@ void launch_host_kernel(int32_t num_curr_level_nodes,
 #else
     printf("next level nodes: %u\n", num_out_level);
 #endif
-#if (DEBUG == 1 && PRODUCE_OUT_FILE == 1)
+#if (DEBUG >= 1 && PRODUCE_OUT_FILE == 1)
     if (num_out_level > 0) {
       for (int32_t i=0; i<num_out_level; i++) {
         fprintf(out_next_level_nodes, "%u\n", out_level[i]);
@@ -355,7 +359,7 @@ void launch_device_shared_queue_kernel(
       print_result(step_nodes_buff, step_nodes);
     }
 #endif
-#if (DEBUG == 1 && PRODUCE_OUT_FILE == 1)
+#if (DEBUG >= 1 && PRODUCE_OUT_FILE == 1)
     //save output
     if (step_nodes > 0) {
       for (int32_t i=0; i<step_nodes; i++) {
@@ -438,7 +442,7 @@ void launch_device_global_queue_kernel(
       print_result(step_nodes_buff, step_nodes);
     }
 #endif
-#if (DEBUG == 1 && PRODUCE_OUT_FILE == 1)
+#if (DEBUG >= 1 && PRODUCE_OUT_FILE == 1)
     //save output
     if (step_nodes > 0) {
       for (int32_t i=0; i<step_nodes; i++) {
@@ -482,37 +486,32 @@ int prepare_and_spawn(const char* input_file, const char* next_level_out_file, c
   }
 #endif
   //device params
-  int32_t* d_node_ptr = 0;
-  int32_t* d_node_neighbours = 0;
-  int32_t* d_node_visited = 0;
+#if (USE_HOST == 0)
   int32_t* d_curr_level_nodes = 0;
   int32_t* d_next_level_nodes = 0;
-#if (USE_HOST == 0)
+  int32_t* d_node_neighbours = 0;
+  int32_t* d_node_ptr = 0;
+  int32_t* d_node_visited = 0;
   int32_t* num_next_level_nodes = 0;
   cudaMallocManaged((void **) &num_next_level_nodes, sizeof(int32_t));
 #endif
 
   //host params
-  int32_t max_node_val = 0;
-  int32_t line_counter = 0;
-  int32_t num_nodes = 0;
-  int32_t total_neighbours = 0;
-  int32_t* node_ptr = 0;
-  int32_t* node_neighbours = 0;
-  int32_t* node_visited = 0;
-  int32_t* curr_level_nodes = 0;
-  int32_t* next_level_nodes = 0;
-  int32_t num_curr_level_nodes = 0;
-  Vector* adj_matrix = 0;
-#if (USE_HOST == 1)
-  int32_t num_next_level_nodes = 0;
-#endif
   FILE *file;
-  int32_t node_ptr_index = 0;
-  int32_t node_neighbours_index = 0;
-  int32_t last_node_val = 0;
   FILE *file_out_next_level_node;
   FILE *file_out_visited_node;
+  Vector* adj_matrix = 0;
+  int32_t line_counter = 0;
+  int32_t max_node_val = 0;
+  int32_t node_neighbours_index = 0;
+  int32_t num_curr_level_nodes = 0;
+  int32_t num_nodes = 0;
+  int32_t total_neighbours = 0;
+  int32_t* curr_level_nodes = 0;
+  int32_t* next_level_nodes = 0;
+  int32_t* node_neighbours = 0;
+  int32_t* node_ptr = 0;
+  int32_t* node_visited = 0;
   file = fopen(input_file, "r");
   if (file == NULL) {
     printf("Error opening the file.\n");
@@ -728,14 +727,18 @@ int prepare_and_spawn(const char* input_file, const char* next_level_out_file, c
 #endif
 
 #if (USE_HOST == 0)
+#if (DEBUG >= 1 && PRODUCE_OUT_FILE == 1)
   cudaMemcpy(node_visited, d_node_visited, max_node_val * sizeof(int32_t), cudaMemcpyDeviceToHost);
   for (int32_t i=0; i<max_node_val; i++) {
     fprintf(file_out_visited_node, "%u\n", node_visited[i]);
   }
+#endif
 #else
+#if (DEBUG >= 1 && PRODUCE_OUT_FILE == 1)
   for (int32_t i=0; i<max_node_val; i++) {
     fprintf(file_out_visited_node, "%u\n", node_visited[i]);
   }
+#endif
 #endif
   fclose(file_out_next_level_node);
   fclose(file_out_visited_node);
