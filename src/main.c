@@ -1,29 +1,30 @@
-%%cu
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define ADJ_MATRIX_ROW_SIZE 1000
-#define DEBUG 1
+#define DEBUG 0
 #define DEBUG_HOST_KER 0
 #define DEBUG_KER 0
 #define DEBUG_KER_GRID 0
 #define ERROR 1
 #define MAX_FILE_COLUMN_LEN 100
+#define PRODUCE_OUT_FILE 1
 #define REAL_NEIGHBOURS_NUM(n) REAL_NODES_NUM(n)
 #define REAL_NODES_NUM(n) n-1
 #define STARTING_LEVEL_NUM 1
 #define STARTING_NODE 0
-#define USE_HOST 0
+#define USE_HOST 1
 #define USE_PREFIX_SUM 0
 
 #define DEVICE_SHARED_MEM_PER_BLOCK 65536/16
 
 const char *file_out_next_level_node_file_name = "file_out_next_level.txt";
 const char *file_out_visited_node_file_name = "file_out_visited.txt";
-const char* file_name = "./1.txt";
+const char* file_name = "./3.txt";
 
 typedef struct Vector {
   int32_t* buff;
@@ -200,53 +201,268 @@ __global__ void gpu_block_queuing_kernel(int32_t *node_ptr, int32_t *node_neighb
 #if (DEBUG_KER == 1)
     printf("Skipping: %u\n", node_idx);
 #endif
-    __syncthreads();
-    if (shared_block_num_next_level_nodes < blockDim.x && threadIdx.x < shared_block_num_next_level_nodes) {
-      printf("thread %u copying to %u\n", threadIdx.x, *num_next_level_nodes);
-      next_level_nodes[*num_next_level_nodes] = shared_block_queue[threadIdx.x];
-      atomicAdd(num_next_level_nodes, 1);
-    }
-    return;
-  }
+  } else {
+    //iterate over neighbours
+    int32_t node = curr_level_nodes[node_idx];
+    if (node_neighbours[node_ptr[node]] < INT32_MAX) {
+      for (int32_t j=node_ptr[node]; j<node_ptr[node+1]; ++j) {
+        const int32_t n = node_neighbours[j];
 #if (DEBUG_KER == 1)
-  else {
-    printf("Computing %u\n", node_idx);
-  }
+        printf("computing node %u neighbours %u thread %u block %u\n", node, n, threadIdx.x, blockIdx.x * blockDim.x);
 #endif
-  //iterate over neighbours
-  int32_t node = curr_level_nodes[node_idx];
-  if (node_neighbours[node_ptr[node]] < INT32_MAX) {
-    for (int32_t j=node_ptr[node]; j<node_ptr[node+1]; ++j) {
-      const int32_t n = node_neighbours[j];
-      const int32_t visited = atomicAnd(&node_visited[n], 1);
-      if (visited == 0) {
-        atomicOr(&node_visited[n], 1);
-        //node_visited[n] = 1;
-        //int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
-        //next_level_nodes[next_pos] = n;
-
-        int32_t next_pos_shared = atomicAdd(&shared_block_num_next_level_nodes, 1);
-        shared_block_queue[next_pos_shared] = n;
+        const int32_t visited = atomicAnd(&node_visited[n], 1);
+        if (visited == 0) {
+          atomicOr(&node_visited[n], 1);
+          int32_t next_pos_shared = atomicAdd(&shared_block_num_next_level_nodes, 1);
+          shared_block_queue[next_pos_shared] = n;
+        }
       }
     }
   }
   __syncthreads();
   if (shared_block_num_next_level_nodes < blockDim.x && threadIdx.x < shared_block_num_next_level_nodes) {
-    printf("thread %u copying to %u\n", threadIdx.x, *num_next_level_nodes);
-    next_level_nodes[*num_next_level_nodes] = shared_block_queue[threadIdx.x];
-    atomicAdd(num_next_level_nodes, 1);
+    int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
+    next_level_nodes[next_pos] = shared_block_queue[threadIdx.x];
+  } else if (shared_block_num_next_level_nodes >= blockDim.x && threadIdx.x < blockDim.x) {
+    const int32_t reminder = shared_block_num_next_level_nodes % blockDim.x;
+    const int32_t write_per_thread = shared_block_num_next_level_nodes / blockDim.x;
+    for (int32_t i=0; i<write_per_thread; i++) {
+      int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
+      next_level_nodes[next_pos] = shared_block_queue[threadIdx.x * write_per_thread + i];
+    }
+    //last thread writes the reminder
+    if (threadIdx.x == blockDim.x-1) {
+      for (int32_t i=0; i<reminder; i++) {
+        int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
+        next_level_nodes[next_pos] = shared_block_queue[(threadIdx.x+1) * write_per_thread + i];
+      }
+    }
   }
-  //for (int i=*num_next_level_nodes, j=0; i<*num_next_level_nodes+thread_iter_counter; i++, j++) {
-  //    next_level_nodes[i] = shared_block_queue[threadIdx.x+j];
-  //}
-  //atomicAdd(num_next_level_nodes, thread_iter_counter);
-  //__syncthreads();
-  /*
-  for (int32_t i=0; i<shared_block_num_next_level_nodes; i++) {
-    printf("%u ", shared_block_queue[i]);
+}
+#endif
+
+#if (USE_HOST == 1)
+void launch_host_kernel(int32_t num_curr_level_nodes,
+                        const int32_t total_neighbours, int32_t *node_ptr,
+                        int32_t *node_neighbours, int32_t *node_visited,
+                        int32_t *curr_level_nodes, int32_t *next_level_nodes,
+                        FILE *out_next_level_nodes) {
+  double total_elapsed_time = 0.0;
+  int32_t level = 0;
+  int8_t done = 0;
+  int32_t* in_level;
+  int32_t* out_level;
+  int32_t num_out_level = num_curr_level_nodes;
+  while (!done) {
+    if (level == 0 || level%2 == 0) {
+      in_level = curr_level_nodes;
+      out_level = next_level_nodes;
+    } else {
+      in_level = next_level_nodes;
+      out_level = curr_level_nodes;
+    }
+    num_curr_level_nodes = num_out_level;
+    num_out_level = 0;
+    clock_t start = clock();
+    host_queuing_kernel(node_ptr, node_neighbours, node_visited, in_level,
+                        out_level, num_curr_level_nodes, total_neighbours,
+                        &num_out_level);
+    clock_t end = clock();
+    total_elapsed_time += (double)(end - start) * 1000.0 / CLOCKS_PER_SEC;
+#if (DEBUG == 1)
+    printf("next level nodes: %u:  ", num_out_level);
+    print_result(out_level, num_out_level);
+#else
+    printf("next level nodes: %u\n", num_out_level);
+#endif
+#if (DEBUG == 1 && PRODUCE_OUT_FILE == 1)
+    if (num_out_level > 0) {
+      for (int32_t i=0; i<num_out_level; i++) {
+        fprintf(out_next_level_nodes, "%u\n", out_level[i]);
+      }
+      fprintf(out_next_level_nodes, "-------------\n");
+    }
+#endif
+    if (num_out_level == 0) {
+      done = 1;
+    }
+    level++;
   }
-  printf("\n");
-  */
+  printf("Time elapsed on host queueing: %f ms\n", total_elapsed_time);
+}
+#else
+void launch_device_shared_queue_kernel(
+    const int32_t threads_per_block, int32_t num_curr_level_nodes,
+    const int32_t total_neighbours, int32_t *d_node_ptr, int32_t *d_node_neighbours,
+    int32_t *d_node_visited, int32_t *d_curr_level_nodes, int32_t *d_next_level_nodes,
+    FILE *out_next_level_nodes) {
+  float total_global_queue_gpu_elapsed_time_ms = 0;
+  int8_t done = 0;
+  int32_t levels = 0;
+  int32_t zero = 0;
+  int32_t grid_size = 0;
+  int32_t* in_level = 0;
+  int32_t* out_level = 0;
+  int32_t kernel_num_curr_level_nodes = 0;
+  int32_t* num_out_level = 0;
+  //initialise num_out_level
+  cudaMallocManaged((void **) &num_out_level, sizeof(int32_t));
+  cudaMemcpy(num_out_level, &num_curr_level_nodes, sizeof(int32_t), cudaMemcpyHostToDevice);
+  while (!done) {
+    cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    if (levels == 0 || levels%2 == 0) {
+      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
+#if (DEBUG_KER_GRID == 1)
+      printf("num grid %u\n", grid_size);
+      printf("total threads: %u\n", grid_size * threads_per_block);
+#endif
+      in_level = d_curr_level_nodes;
+      out_level = d_next_level_nodes;
+    } else {
+      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
+#if (DEBUG_KER_GRID == 1)
+      printf("num grid %u\n", grid_size);
+      printf("total threads: %u\n", grid_size * threads_per_block);
+#endif
+      in_level = d_next_level_nodes;
+      out_level = d_curr_level_nodes;
+    }
+    cudaMemcpy(num_out_level, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
+    float level_global_queue_gpu_elapsed_time_ms;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    gpu_block_queuing_kernel<<<grid_size, threads_per_block>>>(
+        d_node_ptr, d_node_neighbours, d_node_visited, in_level, out_level,
+        kernel_num_curr_level_nodes, total_neighbours, num_out_level);
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&level_global_queue_gpu_elapsed_time_ms, start, stop);
+    total_global_queue_gpu_elapsed_time_ms += level_global_queue_gpu_elapsed_time_ms;
+
+    //check stop criteria
+    int32_t step_nodes;
+    cudaMemcpy(&step_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    int32_t* step_nodes_buff = (int32_t*)malloc(sizeof(int32_t) * step_nodes);
+    if (step_nodes == 0) {
+      done = 1;
+    }
+#if (DEBUG < 1)
+    printf("next level nodes: %u\n", step_nodes);
+#endif
+
+    //debug
+#if (DEBUG == 1)
+    if (!step_nodes_buff) {
+      printf("malloc failed - step_nodes_buff - requested size: %u B\n", step_nodes * sizeof(uint32_t));
+    } else if (step_nodes > 0) {
+      cudaMemcpy(step_nodes_buff, out_level, sizeof(int32_t) * step_nodes, cudaMemcpyDeviceToHost);
+      printf("next level nodes: %u:  ", step_nodes);
+      print_result(step_nodes_buff, step_nodes);
+    }
+#endif
+#if (DEBUG == 1 && PRODUCE_OUT_FILE == 1)
+    //save output
+    if (step_nodes > 0) {
+      for (int32_t i=0; i<step_nodes; i++) {
+        fprintf(out_next_level_nodes, "%u\n", step_nodes_buff[i]);
+      }
+      fprintf(out_next_level_nodes, "-------------\n");
+    }
+#endif
+    levels++;
+  }
+  printf("Time elapsed on block GPU queueing: %f ms\n",
+         total_global_queue_gpu_elapsed_time_ms);
+  cudaFree(num_out_level);
+}
+
+void launch_device_global_queue_kernel(
+    const int32_t threads_per_block, int32_t num_curr_level_nodes,
+    const int32_t total_neighbours, int32_t *d_node_ptr, int32_t *d_node_neighbours,
+    int32_t *d_node_visited, int32_t *d_curr_level_nodes, int32_t *d_next_level_nodes,
+    FILE *out_next_level_nodes) {
+  float total_global_queue_gpu_elapsed_time_ms = 0;
+  int8_t done = 0;
+  int32_t levels = 0;
+  int32_t zero = 0;
+  int32_t grid_size = 0;
+  int32_t* in_level = 0;
+  int32_t* out_level = 0;
+  int32_t kernel_num_curr_level_nodes = 0;
+  int32_t* num_out_level = 0;
+  //initialise num_out_level
+  cudaMallocManaged((void **) &num_out_level, sizeof(int32_t));
+  cudaMemcpy(num_out_level, &num_curr_level_nodes, sizeof(int32_t), cudaMemcpyHostToDevice);
+  while (!done) {
+    cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    if (levels == 0 || levels%2 == 0) {
+      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
+#if (DEBUG_KER_GRID == 1)
+      printf("num grid %u\n", grid_size);
+      printf("total threads: %u\n", grid_size * threads_per_block);
+#endif
+      in_level = d_curr_level_nodes;
+      out_level = d_next_level_nodes;
+    } else {
+      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
+#if (DEBUG_KER_GRID == 1)
+      printf("num grid %u\n", grid_size);
+      printf("total threads: %u\n", grid_size * threads_per_block);
+#endif
+      in_level = d_next_level_nodes;
+      out_level = d_curr_level_nodes;
+    }
+    cudaMemcpy(num_out_level, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
+    float level_global_queue_gpu_elapsed_time_ms;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    gpu_global_queuing_kernel<<<grid_size, threads_per_block>>>(
+        d_node_ptr, d_node_neighbours, d_node_visited, in_level, out_level,
+        kernel_num_curr_level_nodes, total_neighbours, num_out_level);
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&level_global_queue_gpu_elapsed_time_ms, start, stop);
+    total_global_queue_gpu_elapsed_time_ms += level_global_queue_gpu_elapsed_time_ms;
+
+    //check stop criteria
+    int32_t step_nodes;
+    cudaMemcpy(&step_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    int32_t* step_nodes_buff = (int32_t*)malloc(sizeof(int32_t) * step_nodes);
+    if (step_nodes == 0) {
+      done = 1;
+    }
+#if (DEBUG < 1)
+    printf("next level nodes: %u\n", step_nodes);
+#endif
+
+    //debug
+#if (DEBUG == 1)
+    if (!step_nodes_buff) {
+      printf("malloc failed - step_nodes_buff - requested size: %u B\n", step_nodes * sizeof(uint32_t));
+    } else if (step_nodes > 0) {
+      cudaMemcpy(step_nodes_buff, out_level, sizeof(int32_t) * step_nodes, cudaMemcpyDeviceToHost);
+      printf("next level nodes: %u:  ", step_nodes);
+      print_result(step_nodes_buff, step_nodes);
+    }
+#endif
+#if (DEBUG == 1 && PRODUCE_OUT_FILE == 1)
+    //save output
+    if (step_nodes > 0) {
+      for (int32_t i=0; i<step_nodes; i++) {
+        fprintf(out_next_level_nodes, "%u\n", step_nodes_buff[i]);
+      }
+      fprintf(out_next_level_nodes, "-------------\n");
+    }
+#endif
+    levels++;
+  }
+  printf("Time elapsed on global GPU queueing: %f ms\n",
+         total_global_queue_gpu_elapsed_time_ms);
+  cudaFree(num_out_level);
 }
 #endif
 
@@ -255,7 +471,7 @@ int main(int argc, char* argv[]) {
   // retrieve some info abfile_out_next_level_node the CUDA device
   int32_t num_devices;
   cudaGetDeviceCount(&num_devices);
-  cudaDeviceProp main_device_prop;                                 
+  cudaDeviceProp main_device_prop;
   for (int i = 0; i < num_devices; i++) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, i);
@@ -286,7 +502,7 @@ int main(int argc, char* argv[]) {
   int32_t* num_next_level_nodes = 0;
   cudaMallocManaged((void **) &num_next_level_nodes, sizeof(int32_t));
 #endif
-  
+
   //host params
   int32_t max_node_val = 0;
   int32_t line_counter = 0;
@@ -387,7 +603,7 @@ int main(int argc, char* argv[]) {
     printf("Can not open the file");
     return 1;
   }
-  
+
   adj_matrix = (Vector*)malloc(sizeof(Vector) * num_nodes);
   if (!adj_matrix) {
     printf("malloc failed - adj_matrix\n");
@@ -440,7 +656,6 @@ int main(int argc, char* argv[]) {
   if (!d_node_visited) {
     printf("failed malloc - d_node_visited)\n");
   }
-  cudaMemcpy(d_node_visited, node_visited, max_node_val * sizeof(int32_t), cudaMemcpyHostToDevice);
 #endif
 
 #if (DEBUG > 1)
@@ -455,15 +670,6 @@ int main(int argc, char* argv[]) {
   }
   printf("\n");
 #endif
-
-  //populate starting curr_level_nodes
-  curr_level_nodes[0] = STARTING_NODE;
-  num_curr_level_nodes = STARTING_LEVEL_NUM;
-  node_visited[0] = 1;
-#if (USE_HOST == 0)
-  cudaMemcpy(d_node_visited, node_visited, sizeof(int32_t), cudaMemcpyHostToDevice); //copy first 4 bytes
-#endif
-  printf("\nlaunching kernel with initial level nodes size: %u\n", num_curr_level_nodes);
 
 #if (USE_HOST == 0 && USE_PREFIX_SUM == 1)
 #error "Prefix sum not supported"
@@ -487,120 +693,49 @@ int main(int argc, char* argv[]) {
 #endif
 
 #if (USE_HOST == 1)
-  int32_t level = 0;
-  int8_t done = 0;
-  int32_t* in_level;
-  int32_t* out_level;
-  int32_t num_out_level = num_curr_level_nodes;
-  while (!done) {
-    if (level == 0 || level%2 == 0) {
-      in_level = curr_level_nodes;
-      out_level = next_level_nodes;
-    } else {
-      in_level = next_level_nodes;
-      out_level = curr_level_nodes;
-    }
-    num_curr_level_nodes = num_out_level;
-    num_out_level = 0;
-    host_queuing_kernel(node_ptr, node_neighbours, node_visited, in_level,
-                        out_level, num_curr_level_nodes, total_neighbours,
-                        &num_out_level);
-#if (DEBUG == 1)
-    printf("next level nodes: %u:  ", num_out_level);
-    print_result(out_level, num_out_level);
-#endif
-    if (num_out_level > 0) {
-      for (int32_t i=0; i<num_out_level; i++) {
-        fprintf(file_out_next_level_node, "%u\n", out_level[i]);
-      }
-      fprintf(file_out_next_level_node, "-------------\n");   
-    }
-    if (num_out_level == 0) {
-      done = 1;
-    }
-    level++;
-  }
+  //populate starting curr_level_nodes
+  curr_level_nodes[0] = STARTING_NODE;
+  num_curr_level_nodes = STARTING_LEVEL_NUM;
+  node_visited[0] = 1;
+  printf("\nlaunching host kernel with initial level nodes size: %u\n", num_curr_level_nodes);
+  launch_host_kernel(num_curr_level_nodes, total_neighbours, node_ptr,
+                     node_neighbours, node_visited, curr_level_nodes,
+                     next_level_nodes, file_out_next_level_node);
 #else
+  //populate starting curr_level_nodes
+  curr_level_nodes[0] = STARTING_NODE;
+  num_curr_level_nodes = STARTING_LEVEL_NUM;
+  node_visited[0] = 1;
+  cudaMemcpy(d_node_visited, node_visited, sizeof(int32_t), cudaMemcpyHostToDevice); //copy first 4 bytes
+  printf("\nlaunching device kernel (global queue) with initial level nodes size: %u\n", num_curr_level_nodes);
   //copy resources
   cudaMemcpy(d_node_neighbours, node_neighbours, total_neighbours * sizeof(int32_t), cudaMemcpyHostToDevice);
   cudaMemcpy(d_node_ptr, node_ptr, num_nodes * sizeof(int32_t), cudaMemcpyHostToDevice);
   cudaMemcpy(d_curr_level_nodes, curr_level_nodes, num_nodes * sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_node_visited, node_visited, max_node_val * sizeof(int32_t), cudaMemcpyHostToDevice);
 
   const int32_t threads_per_block = main_device_prop.maxThreadsPerBlock/main_device_prop.maxBlocksPerMultiProcessor;
 
-  float total_naive_gpu_elapsed_time_ms = 0;
-  int8_t done = 0;
-  int32_t levels = 0;
-  int32_t zero = 0;
-  int32_t grid_size = 0;
-  int32_t* in_level = 0;
-  int32_t* out_level = 0;
-  int32_t kernel_num_curr_level_nodes = 0;
-  int32_t* num_out_level = 0;
-  //initialise num_in_level
-  cudaMallocManaged((void **) &num_out_level, sizeof(int32_t));
-  cudaMemcpy(num_out_level, &num_curr_level_nodes, sizeof(int32_t), cudaMemcpyHostToDevice);
-  while (!done) {
-    cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    if (levels == 0 || levels%2 == 0) {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
-#if (DEBUG_KER_GRID == 1)
-      printf("num grid %u\n", grid_size);
-      printf("total threads: %u\n", grid_size * threads_per_block);
-#endif
-      in_level = d_curr_level_nodes;
-      out_level = d_next_level_nodes;
-    } else {
-      grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
-#if (DEBUG_KER_GRID == 1)
-      printf("num grid %u\n", grid_size);
-      printf("total threads: %u\n", grid_size * threads_per_block);
-#endif
-      in_level = d_next_level_nodes;
-      out_level = d_curr_level_nodes;
-    }
-    cudaMemcpy(num_out_level, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
-    float naive_gpu_elapsed_time_ms;
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start, 0);
-    gpu_block_queuing_kernel<<<grid_size, threads_per_block>>>(
-        d_node_ptr, d_node_neighbours, d_node_visited, in_level, out_level,
-        kernel_num_curr_level_nodes, total_neighbours, num_out_level);
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&naive_gpu_elapsed_time_ms, start, stop);
-    total_naive_gpu_elapsed_time_ms += naive_gpu_elapsed_time_ms;
+  launch_device_global_queue_kernel(threads_per_block, num_curr_level_nodes, total_neighbours, d_node_ptr,
+                     d_node_neighbours, d_node_visited, d_curr_level_nodes,
+                     d_next_level_nodes, file_out_next_level_node);
 
-    //check stop criteria
-    int32_t step_nodes;
-    cudaMemcpy(&step_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    int32_t* step_nodes_buff = (int32_t*)malloc(sizeof(int32_t) * step_nodes);
-    if (step_nodes == 0) {
-      done = 1;
-    }
-    
-    //debug
-#if (DEBUG == 1)
-    if (!step_nodes_buff) {
-      printf("malloc failed - step_nodes_buff - requested size: %u B\n", step_nodes * sizeof(uint32_t));
-    } else if (step_nodes > 0) {
-      cudaMemcpy(step_nodes_buff, out_level, sizeof(int32_t) * step_nodes, cudaMemcpyDeviceToHost);
-      printf("next level nodes: %u:  ", step_nodes);
-      print_result(step_nodes_buff, step_nodes);
-    }
-#endif
-    //save output
-    if (step_nodes > 0) {
-      for (int32_t i=0; i<step_nodes; i++) {
-        fprintf(file_out_next_level_node, "%u\n", step_nodes_buff[i]);
-      }
-      fprintf(file_out_next_level_node, "-------------\n");
-    }
-    levels++;
-  }
-  printf("Time elapsed on global GPU queueing: %f ms\n", total_naive_gpu_elapsed_time_ms);
+  //copy resources
+  cudaMemcpy(d_node_neighbours, node_neighbours, total_neighbours * sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_node_ptr, node_ptr, num_nodes * sizeof(int32_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_curr_level_nodes, curr_level_nodes, num_nodes * sizeof(int32_t), cudaMemcpyHostToDevice);
+  memset(node_visited, 0, sizeof(int32_t) * max_node_val);
+  cudaMemcpy(d_node_visited, node_visited, max_node_val * sizeof(int32_t), cudaMemcpyHostToDevice);
+  //populate starting curr_level_nodes
+  curr_level_nodes[0] = STARTING_NODE;
+  num_curr_level_nodes = STARTING_LEVEL_NUM;
+  node_visited[0] = 1;
+  cudaMemcpy(d_node_visited, node_visited, sizeof(int32_t), cudaMemcpyHostToDevice); //copy first 4 bytes
+  printf("\nlaunching device kernel (shared queue) with initial level nodes size: %u\n", num_curr_level_nodes);
+
+  launch_device_shared_queue_kernel(threads_per_block, num_curr_level_nodes, total_neighbours, d_node_ptr,
+                     d_node_neighbours, d_node_visited, d_curr_level_nodes,
+                     d_next_level_nodes, file_out_next_level_node);
 #endif
 
 #if (USE_HOST == 0)
@@ -633,6 +768,7 @@ int main(int argc, char* argv[]) {
   cudaFree(d_curr_level_nodes);
   cudaFree(d_next_level_nodes);
   cudaFree(d_node_visited);
+  cudaFree(num_next_level_nodes);
 #endif
 
   return 0;
