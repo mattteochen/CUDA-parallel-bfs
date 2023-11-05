@@ -1,3 +1,4 @@
+%%cu
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,12 +16,14 @@
 #define REAL_NODES_NUM(n) n-1
 #define STARTING_LEVEL_NUM 1
 #define STARTING_NODE 0
-#define USE_HOST 1
+#define USE_HOST 0
 #define USE_PREFIX_SUM 0
+
+#define DEVICE_SHARED_MEM_PER_BLOCK 65536/16
 
 const char *file_out_next_level_node_file_name = "file_out_next_level.txt";
 const char *file_out_visited_node_file_name = "file_out_visited.txt";
-const char* file_name = "./3.txt";
+const char* file_name = "./1.txt";
 
 typedef struct Vector {
   int32_t* buff;
@@ -176,6 +179,74 @@ __global__ void gpu_global_queuing_kernel(int32_t *node_ptr, int32_t *node_neigh
       next_level_nodes[next_pos] = n;
     }
   }
+}
+
+__global__ void gpu_block_queuing_kernel(int32_t *node_ptr, int32_t *node_neighbours,
+                         int32_t *node_visited, int32_t *curr_level_nodes,
+                         int32_t *next_level_nodes,
+                         const int32_t num_curr_level_nodes,
+                         const int32_t total_neighbours,
+                         int32_t *num_next_level_nodes) {
+  __shared__ int32_t shared_block_queue[DEVICE_SHARED_MEM_PER_BLOCK]; //max shared mem per multiprocessor / blocks per multiprocessor used (4K)
+  __shared__ int32_t shared_block_num_next_level_nodes;
+  shared_block_num_next_level_nodes = 0;
+  __syncthreads();
+
+  int32_t node_idx = blockIdx.x * blockDim.x + threadIdx.x;
+#if (DEBUG_KER == 1)
+  printf("node idy %u node idx %u num_curr_level_nodes %u\n", node_idx, node_idxx, num_curr_level_nodes);
+#endif
+  if (node_idx >= num_curr_level_nodes) {
+#if (DEBUG_KER == 1)
+    printf("Skipping: %u\n", node_idx);
+#endif
+    __syncthreads();
+    if (shared_block_num_next_level_nodes < blockDim.x && threadIdx.x < shared_block_num_next_level_nodes) {
+      printf("thread %u copying to %u\n", threadIdx.x, *num_next_level_nodes);
+      next_level_nodes[*num_next_level_nodes] = shared_block_queue[threadIdx.x];
+      atomicAdd(num_next_level_nodes, 1);
+    }
+    return;
+  }
+#if (DEBUG_KER == 1)
+  else {
+    printf("Computing %u\n", node_idx);
+  }
+#endif
+  //iterate over neighbours
+  int32_t node = curr_level_nodes[node_idx];
+  if (node_neighbours[node_ptr[node]] < INT32_MAX) {
+    for (int32_t j=node_ptr[node]; j<node_ptr[node+1]; ++j) {
+      const int32_t n = node_neighbours[j];
+      const int32_t visited = atomicAnd(&node_visited[n], 1);
+      if (visited == 0) {
+        atomicOr(&node_visited[n], 1);
+        //node_visited[n] = 1;
+        //int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
+        //next_level_nodes[next_pos] = n;
+
+        int32_t next_pos_shared = atomicAdd(&shared_block_num_next_level_nodes, 1);
+        shared_block_queue[next_pos_shared] = n;
+      }
+    }
+  }
+  __syncthreads();
+  if (shared_block_num_next_level_nodes < blockDim.x && threadIdx.x < shared_block_num_next_level_nodes) {
+    printf("thread %u copying to %u\n", threadIdx.x, *num_next_level_nodes);
+    next_level_nodes[*num_next_level_nodes] = shared_block_queue[threadIdx.x];
+    atomicAdd(num_next_level_nodes, 1);
+  }
+  //for (int i=*num_next_level_nodes, j=0; i<*num_next_level_nodes+thread_iter_counter; i++, j++) {
+  //    next_level_nodes[i] = shared_block_queue[threadIdx.x+j];
+  //}
+  //atomicAdd(num_next_level_nodes, thread_iter_counter);
+  //__syncthreads();
+  /*
+  for (int32_t i=0; i<shared_block_num_next_level_nodes; i++) {
+    printf("%u ", shared_block_queue[i]);
+  }
+  printf("\n");
+  */
 }
 #endif
 
@@ -494,7 +565,7 @@ int main(int argc, char* argv[]) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start, 0);
-    gpu_global_queuing_kernel<<<grid_size, threads_per_block>>>(
+    gpu_block_queuing_kernel<<<grid_size, threads_per_block>>>(
         d_node_ptr, d_node_neighbours, d_node_visited, in_level, out_level,
         kernel_num_curr_level_nodes, total_neighbours, num_out_level);
     cudaEventRecord(stop, 0);
