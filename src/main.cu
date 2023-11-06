@@ -186,7 +186,7 @@ __global__ void gpu_block_queuing_kernel(int32_t *node_ptr, int32_t *node_neighb
                          const int32_t num_curr_level_nodes,
                          const int32_t total_neighbours,
                          int32_t *num_next_level_nodes) {
-  __shared__ int32_t shared_block_queue[DEVICE_SHARED_MEM_PER_BLOCK]; //max shared mem per multiprocessor / blocks per multiprocessor used (4K)
+  __shared__ int32_t shared_block_queue[DEVICE_SHARED_MEM_PER_BLOCK]; //max shared mem per multiprocessor / blocks per multiprocessor used (4KB)
   __shared__ int32_t shared_block_num_next_level_nodes;
   shared_block_num_next_level_nodes = 0;
   __syncthreads();
@@ -227,17 +227,24 @@ __global__ void gpu_block_queuing_kernel(int32_t *node_ptr, int32_t *node_neighb
   } else if (shared_block_num_next_level_nodes >= blockDim.x && threadIdx.x < blockDim.x) {
     const int32_t reminder = shared_block_num_next_level_nodes % blockDim.x;
     const int32_t write_per_thread = shared_block_num_next_level_nodes / blockDim.x;
+    //printf("r %u w %u\n", reminder, write_per_thread);
     for (int32_t i=0; i<write_per_thread; i++) {
       int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
       next_level_nodes[next_pos] = shared_block_queue[threadIdx.x * write_per_thread + i];
     }
-    //last thread writes the reminder
+    //threads lower than reminder writes one reminder each
+    if (threadIdx.x < reminder) {
+      int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
+      next_level_nodes[next_pos] = shared_block_queue[blockDim.x * write_per_thread + threadIdx.x];
+    }
+    /*
     if (threadIdx.x == blockDim.x-1) {
       for (int32_t i=0; i<reminder; i++) {
         int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
         next_level_nodes[next_pos] = shared_block_queue[(threadIdx.x+1) * write_per_thread + i];
       }
     }
+    */
   }
 }
 #endif
@@ -313,8 +320,12 @@ void launch_device_shared_queue_kernel(
     cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
     grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
 #if (DEBUG_KER_GRID == 1)
-      printf("num grid %u\n", grid_size);
-      printf("total threads: %u\n", grid_size * threads_per_block);
+    printf("num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
+#endif
+    //grid_size = MAX_GRID_SIZE;
+    //threads_per_block = (kernel_num_curr_level_nodes + grid_size - 1) / grid_size;
+#if (DEBUG_KER_GRID == 1)
+    //printf("optimised num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
 #endif
     if (levels == 0 || levels%2 == 0) {
       in_level = d_curr_level_nodes;
@@ -396,8 +407,12 @@ void launch_device_global_queue_kernel(
     cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
     grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
 #if (DEBUG_KER_GRID == 1)
-    printf("num grid %u\n", grid_size);
-    printf("total threads: %u\n", grid_size * threads_per_block);
+    printf("non optimised num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
+#endif
+    //grid_size = MAX_GRID_SIZE;
+    //threads_per_block = (kernel_num_curr_level_nodes + grid_size - 1) / grid_size;
+#if (DEBUG_KER_GRID == 1)
+    //printf("optimised num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
 #endif
     if (levels == 0 || levels%2 == 0) {
       in_level = d_curr_level_nodes;
@@ -791,7 +806,7 @@ int main(int argc, char* argv[]) {
 #else
   in_count = 2; //to complete (set the value to input file num + 1)
   char in_values[][100] =  {
-    "standard5.txt", "standard6.txt"
+    "standard6.txt", "roadNet-CA.txt"
   }; 
   if (in_count == 0) {
     printf("no input file specified. please set input files at line %d\n", __LINE__);
