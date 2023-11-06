@@ -322,11 +322,6 @@ void launch_device_shared_queue_kernel(
 #if (DEBUG_KER_GRID == 1)
     printf("num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
 #endif
-    //grid_size = MAX_GRID_SIZE;
-    //threads_per_block = (kernel_num_curr_level_nodes + grid_size - 1) / grid_size;
-#if (DEBUG_KER_GRID == 1)
-    //printf("optimised num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
-#endif
     if (levels == 0 || levels%2 == 0) {
       in_level = d_curr_level_nodes;
       out_level = d_next_level_nodes;
@@ -407,12 +402,7 @@ void launch_device_global_queue_kernel(
     cudaMemcpy(&kernel_num_curr_level_nodes, num_out_level, sizeof(int32_t), cudaMemcpyDeviceToHost);
     grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
 #if (DEBUG_KER_GRID == 1)
-    printf("non optimised num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
-#endif
-    //grid_size = MAX_GRID_SIZE;
-    //threads_per_block = (kernel_num_curr_level_nodes + grid_size - 1) / grid_size;
-#if (DEBUG_KER_GRID == 1)
-    //printf("optimised num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
+    printf("num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
 #endif
     if (levels == 0 || levels%2 == 0) {
       in_level = d_curr_level_nodes;
