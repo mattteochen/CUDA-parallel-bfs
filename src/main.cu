@@ -820,8 +820,8 @@ int main(int argc, char* argv[]) {
 #endif
     printf("computing: %s\n", in_values[i]);
     const size_t file_name_len = strlen(in_values[i]);
-    char* level_out_file_name = (char*)malloc((file_name_len + 15) * sizeof(char));
-    char* visited_out_file_name = (char*)malloc((file_name_len + 15) * sizeof(char));
+    char* level_out_file_name = (char*)malloc((file_name_len + 30) * sizeof(char));
+    char* visited_out_file_name = (char*)malloc((file_name_len + 30) * sizeof(char));
     if (!level_out_file_name) {
       printf("malloc failed - level_out_file_name\n");
       return 1;
