@@ -6,8 +6,8 @@
 #include <time.h>
 
 #define ADJ_MATRIX_ROW_SIZE 1000
-#define DEBUG 0
-#define DEBUG_HOST_KER 0
+#define DEBUG 1
+#define DEBUG_HOST_KERNEL 0
 #define DEBUG_KER 0
 #define DEBUG_KER_GRID 0
 #define PRODUCE_OUT_FILE 1
@@ -101,47 +101,61 @@ void parse(int32_t* from, int32_t* to, const char* line) {
   *to = atoi(to_str);
 }
 
-void print_result(int32_t* next_level_nodes, const int32_t num_next_level_nodes) {
+void print_result(int32_t* next_level_nodes, const int32_t num_next_level_nodes, int32_t max_buff_len) {
   if (!next_level_nodes) {
     printf("null node\n");
   }
-  for (int32_t i=0; i<num_next_level_nodes; i++) {
-    printf("%u " ,next_level_nodes[i]);
+  int32_t counted = 0;
+  for (int32_t i=0; i<max_buff_len; i++) {
+    if (next_level_nodes[i] != INT32_MAX) {
+      printf("%u " ,next_level_nodes[i]);
+      counted++;
+      if (counted >= num_next_level_nodes) {
+        printf("\n");
+        return;
+      }
+    }
   }
   printf("\n");
 }
 
 #if (USE_HOST == 1)
 void host_queuing_kernel(int32_t *node_ptr, int32_t *node_neighbours,
-                         int32_t *node_visited, int32_t *curr_level_nodes,
-                         int32_t *next_level_nodes,
+                         int32_t *node_visited, int32_t *prefix_sum,
+                         int32_t *curr_level_nodes, int32_t *next_level_nodes,
+                         const int32_t max_buff,
                          const int32_t num_curr_level_nodes,
                          const int32_t total_neighbours,
                          int32_t *num_next_level_nodes) {
   //iterate over neighbours
-  for (int32_t i=0; i<num_curr_level_nodes; ++i) {
+  int32_t computed = 0;
+  for (int32_t i=0; i<max_buff && computed < num_curr_level_nodes; ++i) {
     int32_t node = curr_level_nodes[i];
-#if (DEBUG_HOST_KERNEL == 1)
-    printf("computing node: %u - neighbour index %u\n", node, node_ptr[node]);
-#endif
+    if (node == INT32_MAX) {
+      continue;
+    } else {
+      computed++;
+    }
+    int32_t out_write_index = prefix_sum[node];
     if (node_neighbours[node_ptr[node]] == INT32_MAX) {
-      continue;;
+      continue;
     }
     for (int32_t j=node_ptr[node]; j<node_ptr[node+1]; ++j) {
       int32_t n = node_neighbours[j];
 #if (DEBUG_HOST_KERNEL == 1)
-      printf("j: %u - computing neighbour: %u\n", j, n);
+      printf("computing node: %u - neighbour %u\n", node, n);
 #endif
       if (!node_visited[n]) {
         node_visited[n] = 1;
-        next_level_nodes[*num_next_level_nodes] = n;
-        (*num_next_level_nodes)++;
+#if (DEBUG_HOST_KERNEL == 1)
+        printf("writing %u to %u\n", n, out_write_index);
+#endif
+        next_level_nodes[out_write_index++] = n;
+      } else {
+        next_level_nodes[out_write_index++] = INT32_MAX;
       }
     }
   }
-#if (DEBUG == 1)
-  // print_result(next_level_nodes, *num_next_level_nodes);
-#endif
 }
 #else
 __global__ void gpu_global_queuing_kernel(int32_t *node_ptr, int32_t *node_neighbours,
@@ -254,7 +268,7 @@ void launch_host_kernel(int32_t num_curr_level_nodes,
                         const int32_t total_neighbours, int32_t *node_ptr,
                         int32_t *node_neighbours, int32_t *node_visited,
                         int32_t *curr_level_nodes, int32_t *next_level_nodes,
-                        FILE *out_next_level_nodes) {
+                        FILE *out_next_level_nodes, const int32_t max_buff) {
   double total_elapsed_time = 0.0;
   int32_t level = 0;
   int8_t done = 0;
@@ -269,17 +283,56 @@ void launch_host_kernel(int32_t num_curr_level_nodes,
       in_level = next_level_nodes;
       out_level = curr_level_nodes;
     }
+    for (int32_t i=0; i<max_buff; i++) {
+      out_level[i] = INT32_MAX;
+    }
     num_curr_level_nodes = num_out_level;
     num_out_level = 0;
+
+    int32_t* prefix_sum = (int32_t*)malloc(sizeof(int32_t) * max_buff);
+    if (!prefix_sum) {
+      printf("malloc failed - prefix_sum\n");
+      return;
+    }
+    memset(prefix_sum, 0, sizeof(int32_t) * max_buff);
+    int32_t count = 0;
+    if (num_curr_level_nodes == 1) {
+      prefix_sum[in_level[0]] = 0;
+      //assign next level nodes count
+      count = node_ptr[0+1] - node_ptr[0];
+      num_out_level = count;
+    } else {
+      int32_t counted = 0;
+      for (int32_t i=0; counted<num_curr_level_nodes; i++) {
+        if (in_level[i] != INT32_MAX) {
+          prefix_sum[in_level[i]] = count;
+          count += node_ptr[i+1] - node_ptr[i];
+          counted++;
+        }
+      }
+      //assign next level nodes count
+      num_out_level = counted;
+    }
+
     clock_t start = clock();
-    host_queuing_kernel(node_ptr, node_neighbours, node_visited, in_level,
-                        out_level, num_curr_level_nodes, total_neighbours,
+    host_queuing_kernel(node_ptr, node_neighbours, node_visited, prefix_sum, in_level,
+                        out_level, max_buff, num_curr_level_nodes, total_neighbours,
                         &num_out_level);
     clock_t end = clock();
     total_elapsed_time += (double)(end - start) * 1000.0 / CLOCKS_PER_SEC;
+    free(prefix_sum);
+    int32_t i=0;
+    for (i=0; i<max_buff; i++) {
+      if (out_level[i] != INT32_MAX) {
+        break;
+      } 
+    }
+    if (i == max_buff) {
+      num_out_level = 0;
+    }
 #if (DEBUG == 1)
     printf("next level nodes: %u:  ", num_out_level);
-    print_result(out_level, num_out_level);
+    print_result(out_level, num_out_level, max_buff);
 #else
     printf("next level nodes: %u\n", num_out_level);
 #endif
@@ -560,12 +613,13 @@ int prepare_and_spawn(const char* input_file, const char* next_level_out_file, c
   printf("total nodes: %d\n", REAL_NODES_NUM(num_nodes));
 
   //allocate buffers
-  node_ptr = (int32_t*)malloc(sizeof(int32_t) * num_nodes);
+#warning "Fix this size"
+  node_ptr = (int32_t*)malloc(sizeof(int32_t) * total_neighbours);
   if (!node_ptr) {
     printf("failed malloc - node_ptr\n");
     return 1;
   }
-  for (int32_t i=0; i<num_nodes; i++) {
+  for (int32_t i=0; i<total_neighbours; i++) {
     node_ptr[i] = INT32_MAX;
   }
 #if (USE_HOST == 0)
@@ -703,7 +757,7 @@ int prepare_and_spawn(const char* input_file, const char* next_level_out_file, c
   printf("\nlaunching host kernel with initial level nodes size: %u\n", num_curr_level_nodes);
   launch_host_kernel(num_curr_level_nodes, total_neighbours, node_ptr,
                      node_neighbours, node_visited, curr_level_nodes,
-                     next_level_nodes, file_out_next_level_node);
+                     next_level_nodes, file_out_next_level_node, num_nodes);
 #else
   //populate starting curr_level_nodes
   curr_level_nodes[0] = STARTING_NODE;
@@ -820,8 +874,10 @@ int main(int argc, char* argv[]) {
 #endif
     printf("computing: %s\n", in_values[i]);
     const size_t file_name_len = strlen(in_values[i]);
-    char* level_out_file_name = (char*)malloc((file_name_len + 15) * sizeof(char));
-    char* visited_out_file_name = (char*)malloc((file_name_len + 15) * sizeof(char));
+    char* level_out_file_name = (char*)malloc((file_name_len + 30) * sizeof(char));
+    memset(level_out_file_name, 0, (file_name_len + 30) * sizeof(char));
+    char* visited_out_file_name = (char*)malloc((file_name_len + 30) * sizeof(char));
+    memset(visited_out_file_name, 0, (file_name_len + 30) * sizeof(char));
     if (!level_out_file_name) {
       printf("malloc failed - level_out_file_name\n");
       return 1;
