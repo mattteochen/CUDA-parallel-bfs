@@ -237,14 +237,6 @@ __global__ void gpu_block_queuing_kernel(int32_t *node_ptr, int32_t *node_neighb
       int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
       next_level_nodes[next_pos] = shared_block_queue[blockDim.x * write_per_thread + threadIdx.x];
     }
-    /*
-    if (threadIdx.x == blockDim.x-1) {
-      for (int32_t i=0; i<reminder; i++) {
-        int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
-        next_level_nodes[next_pos] = shared_block_queue[(threadIdx.x+1) * write_per_thread + i];
-      }
-    }
-    */
   }
 }
 #endif
@@ -466,7 +458,7 @@ void launch_device_global_queue_kernel(
 
 int prepare_and_spawn(const char* input_file, const char* next_level_out_file, const char* visited_out_file) {
 #if (USE_HOST == 0)
-  // retrieve some info abfile_out_next_level_node the CUDA device
+  // retrieve some info of the CUDA device
   int32_t num_devices;
   cudaGetDeviceCount(&num_devices);
   cudaDeviceProp main_device_prop;
