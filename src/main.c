@@ -31,6 +31,8 @@ typedef struct Vector {
   int32_t size;
 } Vector;
 
+Vector* g_adj_matrix = 0;
+
 void print_adj_matrix(Vector* adj_matrix, const int32_t size) {
   for (int32_t i=0; i<size; i++) {
     printf("node: %u size: %u\n", i, adj_matrix[i].size);
@@ -142,28 +144,26 @@ void host_queuing_kernel(int32_t *node_ptr, int32_t *node_neighbours,
     }
     for (int32_t j=node_ptr[node]; j<node_ptr[node+1]; ++j) {
       int32_t n = node_neighbours[j];
-#if (DEBUG_HOST_KERNEL == 1)
-      printf("computing node: %u - neighbour %u\n", node, n);
-#endif
       if (!node_visited[n]) {
+#if (DEBUG_HOST_KERNEL == 1)
+        printf("computing node: %u - neighbour %u\n", node, n);
+#endif
         node_visited[n] = 1;
 #if (DEBUG_HOST_KERNEL == 1)
         printf("writing %u to %u\n", n, out_write_index);
 #endif
         next_level_nodes[out_write_index++] = n;
-      } else {
-        next_level_nodes[out_write_index++] = INT32_MAX;
       }
     }
   }
 }
 #else
 __global__ void gpu_global_queuing_kernel(int32_t *node_ptr, int32_t *node_neighbours,
-                         int32_t *node_visited, int32_t *curr_level_nodes,
+                         int32_t *node_visited, int32_t* prefix_sum, int32_t *curr_level_nodes,
                          int32_t *next_level_nodes,
                          const int32_t num_curr_level_nodes,
                          const int32_t total_neighbours,
-                         int32_t *num_next_level_nodes) {
+                         int32_t *num_next_level_nodes, const int32_t max_buff) {
   int32_t node_idx = blockIdx.x * blockDim.x + threadIdx.x;
 #if (DEBUG_KER == 1)
   printf("node idy %u node idx %u num_curr_level_nodes %u\n", node_idx, node_idxx, num_curr_level_nodes);
@@ -181,15 +181,15 @@ __global__ void gpu_global_queuing_kernel(int32_t *node_ptr, int32_t *node_neigh
 #endif
   //iterate over neighbours
   int32_t node = curr_level_nodes[node_idx];
-  if (node_neighbours[node_ptr[node]] == INT32_MAX) {
+  if (node == INT32_MAX || node_neighbours[node_ptr[node]] == INT32_MAX) {
     return;
   }
+  int32_t out_write_index = prefix_sum[node];
   for (int32_t j=node_ptr[node]; j<node_ptr[node+1]; ++j) {
     const int32_t n = node_neighbours[j];
     const int32_t visited = atomicCAS(&node_visited[n], 0, 1);
     if (visited == 0) {
-      int32_t next_pos = atomicAdd(num_next_level_nodes, 1);
-      next_level_nodes[next_pos] = n;
+      next_level_nodes[out_write_index++] = n;
     }
   }
 }
@@ -299,19 +299,18 @@ void launch_host_kernel(int32_t num_curr_level_nodes,
     if (num_curr_level_nodes == 1) {
       prefix_sum[in_level[0]] = 0;
       //assign next level nodes count
-      count = node_ptr[0+1] - node_ptr[0];
+      count = node_ptr[in_level[1]] - node_ptr[in_level[0]];
       num_out_level = count;
     } else {
       int32_t counted = 0;
-      for (int32_t i=0; counted<num_curr_level_nodes; i++) {
-        if (in_level[i] != INT32_MAX) {
-          prefix_sum[in_level[i]] = count;
-          count += node_ptr[i+1] - node_ptr[i];
+      int32_t it;
+      for (it=0; counted<num_curr_level_nodes; it++) {
+        if (in_level[it] != INT32_MAX) {
+          prefix_sum[in_level[it]] = count;
+          count += g_adj_matrix[in_level[it]].size;
           counted++;
         }
       }
-      //assign next level nodes count
-      num_out_level = counted;
     }
 
     clock_t start = clock();
@@ -321,14 +320,17 @@ void launch_host_kernel(int32_t num_curr_level_nodes,
     clock_t end = clock();
     total_elapsed_time += (double)(end - start) * 1000.0 / CLOCKS_PER_SEC;
     free(prefix_sum);
-    int32_t i=0;
-    for (i=0; i<max_buff; i++) {
+
+    int32_t c = 0;
+    for (int32_t i=0; i<max_buff; i++) {
       if (out_level[i] != INT32_MAX) {
-        break;
+        c++;  
       } 
     }
-    if (i == max_buff) {
+    if (!c) {
       num_out_level = 0;
+    } else {
+      num_out_level = c;
     }
 #if (DEBUG == 1)
     printf("next level nodes: %u:  ", num_out_level);
@@ -374,11 +376,6 @@ void launch_device_shared_queue_kernel(
     grid_size = (kernel_num_curr_level_nodes + threads_per_block - 1) / threads_per_block;
 #if (DEBUG_KER_GRID == 1)
     printf("num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
-#endif
-    //grid_size = MAX_GRID_SIZE;
-    //threads_per_block = (kernel_num_curr_level_nodes + grid_size - 1) / grid_size;
-#if (DEBUG_KER_GRID == 1)
-    //printf("optimised num grid %u with tpb %u tot_t %u\n", grid_size, threads_per_block, grid_size * threads_per_block);
 #endif
     if (levels == 0 || levels%2 == 0) {
       in_level = d_curr_level_nodes;
@@ -694,6 +691,7 @@ int prepare_and_spawn(const char* input_file, const char* next_level_out_file, c
 
   //move
   adj_to_csr(adj_matrix, num_nodes, node_ptr, &node_neighbours, &node_neighbours_index, &total_neighbours);
+  g_adj_matrix = adj_matrix;
 #if (USE_HOST == 0)
   cudaMallocManaged((void **) &d_node_neighbours, sizeof(int32_t) * total_neighbours);
   if (!d_node_neighbours) {
@@ -775,7 +773,7 @@ int prepare_and_spawn(const char* input_file, const char* next_level_out_file, c
 
   launch_device_global_queue_kernel(threads_per_block, num_curr_level_nodes, total_neighbours, d_node_ptr,
                      d_node_neighbours, d_node_visited, d_curr_level_nodes,
-                     d_next_level_nodes, file_out_next_level_node);
+                     d_next_level_nodes, file_out_next_level_node, num_nodes);
 
   //copy resources
   cudaMemcpy(d_node_neighbours, node_neighbours, total_neighbours * sizeof(int32_t), cudaMemcpyHostToDevice);
